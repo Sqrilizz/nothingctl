@@ -846,7 +846,7 @@ pub static B179: Model = Model {
     base: "B179",
     name: "CMF Buds 2",
     kind: Kind::Earbuds,
-    model_ids: &["19EF24", "FF2AB0", "D9AB5D"],
+    model_ids: &["19EF24", "FF2AB0", "D9AB5D", "64647F"],
     battery: EARBUDS,
     anc: ANC_FULL,
     anc_aliases: &[],
