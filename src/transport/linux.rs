@@ -1,8 +1,3 @@
-//! BlueZ transport. Every RFCOMM link is opened by service UUID: a client
-//! profile is registered for the UUID and the device's ConnectProfile makes
-//! BlueZ resolve the channel over SDP and hand over the socket. No channel
-//! number appears anywhere.
-
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -50,7 +45,6 @@ pub async fn list() -> anyhow::Result<Vec<DeviceInfo>> {
     Ok(matching(&session).await?.into_iter().map(|(_, i)| i).collect())
 }
 
-/// Registers a client profile for `service` and asks BlueZ to connect it.
 async fn connect_service(session: &Session, device: &Device, service: Uuid) -> anyhow::Result<(Stream, ProfileHandle)> {
     let mut handle = session
         .register_profile(Profile {
@@ -106,14 +100,22 @@ pub async fn open(address: Option<&str>) -> anyhow::Result<Connection> {
         .map(|(d, _)| d)
         .ok_or_else(|| anyhow!("{} disappeared", chosen.address))?;
 
-    let has_fast_pair = device.uuids().await.ok().flatten().is_some_and(|u| u.contains(&uuid(FAST_PAIR_UUID)));
-    if !has_fast_pair {
-        return Err(UnsupportedModel { model_id: None, address: chosen.address }.into());
-    }
-    let model_id = fast_pair_model_id(&session, &device).await?;
-    crate::debug!("model id {model_id}");
-    let Some(model) = model::by_model_id(&model_id) else {
-        return Err(UnsupportedModel { model_id: Some(model_id), address: chosen.address }.into());
+    let (model, model_id) = match fast_pair_model_id(&session, &device).await {
+        Ok(id) => {
+            crate::debug!("model id {id}");
+            let Some(m) = model::by_model_id(&id) else {
+                return Err(UnsupportedModel { model_id: Some(id), address: chosen.address }.into());
+            };
+            (m, id)
+        }
+        Err(e) => {
+            crate::debug!("fast pair read failed: {e}; falling back to device name matching");
+            let Some(m) = model::MODELS.iter().copied().find(|m| chosen.name.eq_ignore_ascii_case(m.name)) else {
+                return Err(e);
+            };
+            let id = m.model_ids.first().copied().unwrap_or("UNKNOWN").to_string();
+            (m, id)
+        }
     };
 
     let (stream, handle) = connect_service(&session, &device, uuid(CONTROL_UUID)).await?;

@@ -1,6 +1,6 @@
-// The protocol tables are only reached through the Linux transport.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+mod auto;
 mod log;
 mod protocol;
 mod session;
@@ -19,24 +19,17 @@ use protocol::state::{State, snapshot};
 use session::{Link, planned_action, planned_connect};
 use transport::UnsupportedModel;
 
-/// Exit code for a device refused over its model, distinct from 1 (link or
-/// connection failure) and 2 (usage error, from clap).
 const EXIT_UNSUPPORTED: u8 = 3;
 
 #[derive(Parser)]
 #[command(name = "nothingctl", version, about = "Control Nothing and CMF audio devices over Bluetooth")]
 struct Cli {
-    /// Print the frames that would be sent, in hex, and connect to nothing.
     #[arg(long, global = true)]
     dry_run: bool,
-    /// Model to plan frames for with --dry-run.
     #[arg(long, global = true, default_value = "B175")]
     model: String,
-    /// Firmware version to plan frames for with --dry-run, for the features
-    /// some models have on some firmware only.
     #[arg(long, global = true)]
     firmware: Option<String>,
-    /// Debug output on stderr: every frame sent and received.
     #[arg(short, long, global = true)]
     verbose: bool,
     #[command(subcommand)]
@@ -45,19 +38,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Paired devices that expose the Nothing control service.
     List {
         #[arg(long)]
         json: bool,
     },
-    /// Read the device state once and print it.
     Status {
         #[arg(short, long)]
         device: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Change one setting.
     #[command(after_help = format!("Settings: {GRAMMAR}\nAvailable values depend on the model; `status` lists them."))]
     Set {
         #[arg(short, long)]
@@ -65,8 +55,32 @@ enum Cmd {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
         setting: Vec<String>,
     },
-    /// Hold the connection, print a JSON snapshot on every change, take
-    /// `set` arguments on stdin, one per line.
+    Anc {
+        #[arg(short, long)]
+        device: Option<String>,
+        #[arg(value_name = "MODE")]
+        mode: Option<String>,
+        #[arg(long)]
+        notify: bool,
+    },
+    Auto {
+        #[arg(short, long)]
+        device: Option<String>,
+        #[arg(long, default_value = "vocals")]
+        call_eq: String,
+        #[arg(long, default_value = "1")]
+        call_bass: String,
+        #[arg(long, default_value = "transparency")]
+        call_anc: String,
+        #[arg(long, default_value = "dirac")]
+        normal_eq: String,
+        #[arg(long, default_value = "3")]
+        normal_bass: String,
+        #[arg(long, default_value = "high")]
+        normal_anc: String,
+        #[arg(long)]
+        notify: bool,
+    },
     Watch {
         #[arg(short, long)]
         device: Option<String>,
@@ -125,6 +139,12 @@ async fn dry_run(cli: &Cli) -> anyhow::Result<ExitCode> {
             let action = Action::parse(setting).map_err(|e| anyhow!(e))?;
             print_frames(&planned_action(model, &state, &action, &mut ops).map_err(|e| anyhow!(e))?);
         }
+        Cmd::Anc { mode, .. } => {
+            let target = mode.as_deref().unwrap_or("high");
+            let action = Action::parse(&["anc", target]).map_err(|e| anyhow!(e))?;
+            print_frames(&planned_action(model, &state, &action, &mut ops).map_err(|e| anyhow!(e))?);
+        }
+        Cmd::Auto { .. } => anyhow::bail!("auto mode requires real device connection"),
         Cmd::Watch { .. } => {
             print_frames(&planned_connect(model, cli.firmware.as_deref(), &mut ops));
             let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
@@ -186,6 +206,62 @@ async fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             }
             link.one_shot(&action).await.map_err(|e| anyhow!(e))?;
             print_json(&serde_json::json!({"type": "ack", "cmd": action.describe()}));
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Anc { device, mode, notify } => {
+            let conn = transport::open(device.as_deref()).await?;
+            let (r, w) = tokio::io::split(conn.stream);
+            let mut link = Link::new(conn.model, r, w);
+            link.connect_sequence().await.context("link dropped during the status read")?;
+
+            let current_anc = link.state.anc_code.and_then(|c| conn.model.anc_by_code(c)).map(|m| m.name);
+
+            match mode.as_deref() {
+                None => {
+                    let modes: Vec<&str> =
+                        conn.model.anc(link.state.firmware.as_deref()).iter().map(|m| m.name).collect();
+                    println!("current: {}", current_anc.unwrap_or("unknown"));
+                    println!("available: {}", modes.join(", "));
+                    Ok(ExitCode::SUCCESS)
+                }
+                Some("cycle") | Some("next") => {
+                    let next_mode = match current_anc {
+                        Some("high") | Some("mid") | Some("low") | Some("adaptive") => "transparency",
+                        Some("transparency") => "off",
+                        _ => "high",
+                    };
+                    let action = Action::parse(&["anc", next_mode]).map_err(|e| anyhow!(e))?;
+                    link.one_shot(&action).await.map_err(|e| anyhow!(e))?;
+                    if *notify {
+                        auto::notify("Noise Control", next_mode).await;
+                    }
+                    print_json(
+                        &serde_json::json!({"type": "ack", "cmd": format!("anc {next_mode}"), "mode": next_mode}),
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                Some(target) => {
+                    let action = Action::parse(&["anc", target]).map_err(|e| anyhow!(e))?;
+                    link.one_shot(&action).await.map_err(|e| anyhow!(e))?;
+                    if *notify {
+                        auto::notify("Noise Control", target).await;
+                    }
+                    print_json(&serde_json::json!({"type": "ack", "cmd": format!("anc {target}"), "mode": target}));
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+        Cmd::Auto { device, call_eq, call_bass, call_anc, normal_eq, normal_bass, normal_anc, notify } => {
+            let config = auto::AutoConfig {
+                call_eq: call_eq.clone(),
+                call_bass: call_bass.clone(),
+                call_anc: call_anc.clone(),
+                normal_eq: normal_eq.clone(),
+                normal_bass: normal_bass.clone(),
+                normal_anc: normal_anc.clone(),
+                notify: *notify,
+            };
+            auto::run_auto(device.as_deref(), config).await?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Watch { device } => {
