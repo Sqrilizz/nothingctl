@@ -1,8 +1,3 @@
-//! Windows transport. Devices and their SDP records come from WinRT; the
-//! RFCOMM link is a Winsock AF_BTH socket addressed by service class UUID with
-//! port 0, so Windows resolves the channel over SDP. No channel number appears
-//! anywhere.
-
 use std::io;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll, ready};
@@ -32,8 +27,6 @@ fn format_address(addr: u64) -> String {
     format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", b[2], b[3], b[4], b[5], b[6], b[7])
 }
 
-/// Whether the device's cached SDP records list `service`. Windows reads them
-/// at pairing, so this works while the device is out of range.
 fn offers(device: &BluetoothDevice, service: &str) -> windows::core::Result<bool> {
     let id = RfcommServiceId::FromUuid(guid(service))?;
     let result = device.GetRfcommServicesForIdWithCacheModeAsync(&id, BluetoothCacheMode::Cached)?.join()?;
@@ -69,7 +62,6 @@ struct Socket(SOCKET);
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        // Closing unblocks the reader thread's recv, which then exits.
         unsafe {
             shutdown(self.0, SD_BOTH);
             closesocket(self.0);
@@ -104,9 +96,6 @@ fn connect_service(address: u64, service: &str) -> anyhow::Result<Socket> {
     Ok(sock)
 }
 
-/// A blocking Winsock RFCOMM socket as a tokio stream: a thread blocks in
-/// recv and forwards chunks, writes go straight to send. Frames are a few
-/// dozen bytes, so send never blocks long enough to matter.
 struct BthStream {
     socket: Socket,
     rx: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
@@ -182,13 +171,40 @@ pub async fn open(address: Option<&str>) -> anyhow::Result<Connection> {
         .ok_or_else(|| anyhow!("{} disappeared", chosen.address))?;
     let bt_addr = device.BluetoothAddress()?;
 
-    if !offers(&device, FAST_PAIR_UUID).unwrap_or(false) {
-        return Err(UnsupportedModel { model_id: None, address: chosen.address }.into());
-    }
-    let model_id = read_model_id(open_stream(bt_addr, FAST_PAIR_UUID).await?).await?;
-    crate::debug!("model id {model_id}");
-    let Some(model) = model::by_model_id(&model_id) else {
-        return Err(UnsupportedModel { model_id: Some(model_id), address: chosen.address }.into());
+    let (model, model_id) = if offers(&device, FAST_PAIR_UUID).unwrap_or(false) {
+        let stream_res = open_stream(bt_addr, FAST_PAIR_UUID).await;
+        let id_res = match stream_res {
+            Ok(s) => read_model_id(s).await,
+            Err(e) => Err(e),
+        };
+        match id_res {
+            Ok(id) => {
+                crate::debug!("model id {id}");
+                if let Some(m) = model::by_model_id(&id) {
+                    (m, id)
+                } else if let Some(m) = model::MODELS.iter().copied().find(|m| chosen.name.eq_ignore_ascii_case(m.name))
+                {
+                    (m, id)
+                } else {
+                    return Err(UnsupportedModel { model_id: Some(id), address: chosen.address }.into());
+                }
+            }
+            Err(e) => {
+                crate::debug!("fast pair read failed: {e}; falling back to device name matching");
+                let Some(m) = model::MODELS.iter().copied().find(|m| chosen.name.eq_ignore_ascii_case(m.name)) else {
+                    return Err(UnsupportedModel { model_id: None, address: chosen.address }.into());
+                };
+                let id = m.model_ids.first().copied().unwrap_or("UNKNOWN").to_string();
+                (m, id)
+            }
+        }
+    } else {
+        crate::debug!("device does not offer fast pair; falling back to device name matching");
+        let Some(m) = model::MODELS.iter().copied().find(|m| chosen.name.eq_ignore_ascii_case(m.name)) else {
+            return Err(UnsupportedModel { model_id: None, address: chosen.address }.into());
+        };
+        let id = m.model_ids.first().copied().unwrap_or("UNKNOWN").to_string();
+        (m, id)
     };
 
     let stream = open_stream(bt_addr, CONTROL_UUID).await?;
